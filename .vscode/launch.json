@@ -1,0 +1,14 @@
+{
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Spring Boot-LedgerApplication<Ledger>",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "mainClass": "com.upi_backend.Ledger.LedgerApplication",
+            "projectName": "Ledger",
+            "args": "",
+            "envFile": "${workspaceFolder}/.env"
+        }
+    ]
+}
