@@ -1,0 +1,22 @@
+_format_version: "3.0"
+# Ai generated Kong configuration file. Edit with caution. contains: super secret information. Do not share >:(
+services:
+  # 1. Define where our Go Router lives
+  - name: go-router
+    url: http://host.docker.internal:8081
+    routes:
+      # 2. Tell Kong to listen for this specific path
+      - name: transfer-route
+        paths:
+          - /api/transfer
+        strip_path: false
+    plugins:
+      # 3. Slap a JWT lock on this route
+      - name: jwt
+
+# 4. Create a test user who is allowed to pass
+consumers:
+  - username: verified-app-user
+    jwt_secrets:
+      - key: "upi-issuer"
+        secret: "super-secret-bank-key-that-is-exactly-32-bytes!" # In production, this is a highly guarded secret

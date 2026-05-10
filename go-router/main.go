@@ -1,7 +1,6 @@
 package main
 
-//Ai generated, yet to learn GoLang, so expect some weird code. But it works! :)
-
+//Ai generated, idk GoLang yet, so expect some weird code. But it works
 import (
 	"context"
 	"fmt"
@@ -11,57 +10,84 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 )
 
-// 1. GLOBAL VARIABLES
-// context.Background() is required by the Redis library to manage timeouts and cancellations.
-var ctx = context.Background()
 var rdb *redis.Client
 
-// 2. THE INIT FUNCTION
-// Go automatically runs any function named init() exactly ONCE before main() starts.
-// It is the perfect place to set up database connections.
+// 1. INITIALIZE THE TRACER
+func initTracer() *sdktrace.TracerProvider {
+	// Point the exporter to our local Docker Jaeger instance
+	exporter, err := otlptracehttp.New(context.Background(),
+		otlptracehttp.WithEndpoint("localhost:4318"),
+		otlptracehttp.WithInsecure(), // No TLS for local testing
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Label our service so it shows up beautifully in the Jaeger UI
+	res := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName("go-ingress-router"),
+	)
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	return tp
+}
+
 func init() {
 	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379", // Pointing to our new Docker container
+		Addr: "localhost:6379",
 	})
 	log.Println("Connected to Redis Shield...")
 }
 
 func transferHandler(w http.ResponseWriter, r *http.Request) {
-	// 3. EXTRACT THE IDEMPOTENCY KEY
-	// We expect the client to pass this in the HTTP Headers
+	// 2. THE BACKPACK: Grab the context that OpenTelemetry automatically created for this request
+	ctx := r.Context()
+
 	idemKey := r.Header.Get("X-Idempotency-Key")
 	if idemKey == "" {
-		http.Error(w, "Missing X-Idempotency-Key header. Request rejected.", http.StatusBadRequest)
+		http.Error(w, "Missing X-Idempotency-Key", http.StatusBadRequest)
 		return
 	}
 
-	// 4. CHECK THE SHIELD (REDIS)
-	// We ask Redis: "Do you have this key?"
+	// Pass the backpack (ctx) to Redis! If this takes long, Jaeger will show it.
 	val, err := rdb.Get(ctx, idemKey).Result()
 	if err == nil {
-		// err == nil means Redis FOUND the key. This is a duplicate request!
-		log.Printf("BLOCKED: Duplicate request detected for key: %s\n", idemKey)
-		msg := fmt.Sprintf("Duplicate request. Previous status: %s", val)
-		http.Error(w, msg, http.StatusConflict) // Return a 409 Conflict HTTP status
+		log.Printf("BLOCKED: Duplicate key: %s\n", idemKey)
+		http.Error(w, fmt.Sprintf("Duplicate request: %s", val), http.StatusConflict)
 		return
 	}
 
-	log.Printf("Key %s is fresh. Forwarding to Ledger...\n", idemKey)
-
-	// --- THE ORIGINAL PROXY LOGIC ---
 	queryParams := r.URL.Query()
 	springBootURL := "http://localhost:8080/api/transfer"
 
-	req, err := http.NewRequest(http.MethodPost, springBootURL, nil)
+	// 3. THE HANDOFF: Use NewRequestWithContext so the Trace ID gets stuffed into the outgoing headers!
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, springBootURL, nil)
 	if err != nil {
 		http.Error(w, "Failed to create request", http.StatusInternalServerError)
 		return
 	}
 	req.URL.RawQuery = queryParams.Encode()
 
-	client := &http.Client{}
+	// 4. THE INTERCEPTOR: Wrap the standard HTTP client with otelhttp so it actually transmits the trace
+	client := &http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "Failed to reach Ledger Service", http.StatusBadGateway)
@@ -69,34 +95,30 @@ func transferHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, "Failed to read response", http.StatusInternalServerError)
-		return
-	}
-	// --------------------------------
-
-	// 5. SECURE THE SHIELD
-	// If Java replies with a 200 OK (Transfer successful!), we save the key to Redis.
-	// We give it a Time-To-Live (TTL) of 24 hours so our RAM doesn't fill up forever.
 	if resp.StatusCode == http.StatusOK {
-		err = rdb.Set(ctx, idemKey, "COMPLETED", 24*time.Hour).Err()
-		if err != nil {
-			log.Println("Warning: Failed to save key to Redis, system is vulnerable to retries.")
-		} else {
-			log.Printf("Successfully cached key %s in Redis.\n", idemKey)
-		}
+		// Pass the backpack (ctx) to Redis again
+		rdb.Set(ctx, idemKey, "COMPLETED", 24*time.Hour)
 	}
 
+	body, _ := io.ReadAll(resp.Body)
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
 }
 
 func main() {
-	http.HandleFunc("/api/transfer", transferHandler)
-	fmt.Println("🚀 Go Router & Shield starting on http://localhost:8081")
-	err := http.ListenAndServe(":8081", nil)
-	if err != nil {
-		log.Fatal("Server failed to start: ", err)
-	}
+	tp := initTracer()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}()
+
+	// 5. WRAP THE ROUTER: This automatically starts a trace for every incoming request
+	handler := http.HandlerFunc(transferHandler)
+	wrappedHandler := otelhttp.NewHandler(handler, "Transfer_Endpoint")
+
+	http.Handle("/api/transfer", wrappedHandler)
+
+	fmt.Println("🚀 Go Router (with X-Ray) starting on http://localhost:8081")
+	log.Fatal(http.ListenAndServe(":8081", nil))
 }
