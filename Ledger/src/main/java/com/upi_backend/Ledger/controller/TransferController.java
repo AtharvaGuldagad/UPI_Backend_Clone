@@ -1,26 +1,28 @@
 package com.upi_backend.Ledger.controller;
 
-import com.upi_backend.Ledger.service.TransferService;
-import org.springframework.web.bind.annotation.*;
-import java.math.BigDecimal;
+// HTTP controller we no longer need 
 
-@RestController
-@RequestMapping("/api")
-public class TransferController {
+// import com.upi_backend.Ledger.service.TransferService;
+// import org.springframework.web.bind.annotation.*;
+// import java.math.BigDecimal;
 
-    private final TransferService transferService;
+// @RestController
+// @RequestMapping("/api")
+// public class TransferController {
 
-    public TransferController(TransferService transferService) {
-        this.transferService = transferService;
-    }
+//     private final TransferService transferService;
 
-    @PostMapping("/transfer")
-    public String transfer(@RequestParam String from, @RequestParam String to, @RequestParam BigDecimal amount) {
-        try {
-            transferService.transferMoney(from, to, amount);
-            return "Transfer successful!";
-        } catch (Exception e) {
-            return "Transfer failed: " + e.getMessage();
-        }
-    }
-}
+//     public TransferController(TransferService transferService) {
+//         this.transferService = transferService;
+//     }
+
+//     @PostMapping("/transfer")
+//     public String transfer(@RequestParam String from, @RequestParam String to, @RequestParam BigDecimal amount) {
+//         try {
+//             transferService.transferMoney(from, to, amount);
+//             return "Transfer successful!";
+//         } catch (Exception e) {
+//             return "Transfer failed: " + e.getMessage();
+//         }
+//     }
+// }

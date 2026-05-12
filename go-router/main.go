@@ -1,15 +1,17 @@
 package main
 
-//Ai generated, idk GoLang yet, so expect some weird code. But it works
+//Ai Generated, so expect weird code, but works.
+
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/segmentio/kafka-go"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -20,22 +22,27 @@ import (
 )
 
 var rdb *redis.Client
+var kafkaWriter *kafka.Writer
 
-// 1. INITIALIZE THE TRACER
+type TransferEvent struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	FromAccount    string `json:"from_account"`
+	ToAccount      string `json:"to_account"`
+	Amount         string `json:"amount"`
+}
+
 func initTracer() *sdktrace.TracerProvider {
-	// Point the exporter to our local Docker Jaeger instance
 	exporter, err := otlptracehttp.New(context.Background(),
 		otlptracehttp.WithEndpoint("localhost:4318"),
-		otlptracehttp.WithInsecure(), // No TLS for local testing
+		otlptracehttp.WithInsecure(),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Label our service so it shows up beautifully in the Jaeger UI
 	res := resource.NewWithAttributes(
 		semconv.SchemaURL,
-		semconv.ServiceName("go-ingress-router"),
+		semconv.ServiceName("go-ingress-producer"),
 	)
 
 	tp := sdktrace.NewTracerProvider(
@@ -44,18 +51,22 @@ func initTracer() *sdktrace.TracerProvider {
 	)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
+
 	return tp
 }
 
 func init() {
-	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-	log.Println("Connected to Redis Shield...")
+	rdb = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+
+	kafkaWriter = &kafka.Writer{
+		Addr:     kafka.TCP("localhost:9092"),
+		Topic:    "transfer-requests",
+		Balancer: &kafka.LeastBytes{},
+	}
+	log.Println("Connected to Redis Shield and Kafka Queue...")
 }
 
 func transferHandler(w http.ResponseWriter, r *http.Request) {
-	// 2. THE BACKPACK: Grab the context that OpenTelemetry automatically created for this request
 	ctx := r.Context()
 
 	idemKey := r.Header.Get("X-Idempotency-Key")
@@ -64,61 +75,63 @@ func transferHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pass the backpack (ctx) to Redis! If this takes long, Jaeger will show it.
+	// 1. Check Redis Shield
 	val, err := rdb.Get(ctx, idemKey).Result()
 	if err == nil {
-		log.Printf("BLOCKED: Duplicate key: %s\n", idemKey)
 		http.Error(w, fmt.Sprintf("Duplicate request: %s", val), http.StatusConflict)
 		return
 	}
 
+	// 2. Build the Event Payload
 	queryParams := r.URL.Query()
-	springBootURL := "http://localhost:8080/api/transfer"
+	event := TransferEvent{
+		IdempotencyKey: idemKey,
+		FromAccount:    queryParams.Get("from"),
+		ToAccount:      queryParams.Get("to"),
+		Amount:         queryParams.Get("amount"),
+	}
+	eventBytes, _ := json.Marshal(event)
 
-	// 3. THE HANDOFF: Use NewRequestWithContext so the Trace ID gets stuffed into the outgoing headers!
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, springBootURL, nil)
+	// 3. Extract the Trace Backpack for Kafka
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
+	var kafkaHeaders []kafka.Header
+	for k, v := range carrier {
+		kafkaHeaders = append(kafkaHeaders, kafka.Header{Key: k, Value: []byte(v)})
+	}
+
+	// 4. FIRE AND FORGET to Kafka
+	msg := kafka.Message{
+		Key:     []byte(idemKey), // Using IdemKey as Kafka Key guarantees order for the same transaction
+		Value:   eventBytes,
+		Headers: kafkaHeaders,
+	}
+
+	err = kafkaWriter.WriteMessages(ctx, msg)
 	if err != nil {
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		log.Printf("Failed to write to Kafka: %v", err)
+		http.Error(w, "Broker unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	req.URL.RawQuery = queryParams.Encode()
 
-	// 4. THE INTERCEPTOR: Wrap the standard HTTP client with otelhttp so it actually transmits the trace
-	client := &http.Client{
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
-	}
+	// 5. Lock it in Redis and Return FAST
+	rdb.Set(ctx, idemKey, "PENDING_IN_KAFKA", 24*time.Hour)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(w, "Failed to reach Ledger Service", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		// Pass the backpack (ctx) to Redis again
-		rdb.Set(ctx, idemKey, "COMPLETED", 24*time.Hour)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	w.WriteHeader(resp.StatusCode)
-	w.Write(body)
+	w.WriteHeader(http.StatusAccepted) // 202 Accepted
+	w.Write([]byte(`{"status": "Transfer Pending", "message": "Your transaction is being processed."}`))
 }
 
 func main() {
 	tp := initTracer()
-	defer func() {
-		if err := tp.Shutdown(context.Background()); err != nil {
-			log.Printf("Error shutting down tracer provider: %v", err)
-		}
-	}()
+	defer tp.Shutdown(context.Background())
+	defer kafkaWriter.Close()
 
-	// 5. WRAP THE ROUTER: This automatically starts a trace for every incoming request
 	handler := http.HandlerFunc(transferHandler)
-	wrappedHandler := otelhttp.NewHandler(handler, "Transfer_Endpoint")
+	wrappedHandler := otelhttp.NewHandler(handler, "Produce_Transfer_Event")
 
 	http.Handle("/api/transfer", wrappedHandler)
 
-	fmt.Println("🚀 Go Router (with X-Ray) starting on http://localhost:8081")
+	fmt.Println("🚀 Go Kafka Producer starting on http://localhost:8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
 }
