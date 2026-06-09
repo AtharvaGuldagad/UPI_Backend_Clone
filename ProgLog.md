@@ -11,8 +11,8 @@
     - Persistence (ACID Ledger): PostgreSQL (via Docker)
     - Cache & Shielding: Redis (via Docker)
     - Asynchronous/Event Broker: Apache Kafka
-    - Edge/API Gateway: Kong or Apache APISIX
-    - Observability: OpenTelemetry, Prometheus, Grafana, Jaeger
+    - Edge/API Gateway: Kong
+    - Observability: OpenTelemetry, Grafana, Jaeger
   </TARGET_TECH_STACK>
 
   <ARCHITECTURE>
