@@ -33,5 +33,5 @@ This is where we are heading as the tracer bullets expand:
 * **Persistence (ACID Ledger):** PostgreSQL (Evaluating CockroachDB for horizontal SQL scaling later)
 * **Event Broker:** Apache Kafka
 * **Cache & Deduplication:** Redis Cluster
-* **API Gateway:** Kong or Apache APISIX
-* **Observability:** OpenTelemetry, Prometheus, Grafana, Jaeger
+* **API Gateway:** Kong
+* **Observability:** OpenTelemetry, Grafana, Jaeger
